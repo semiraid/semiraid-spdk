@@ -127,6 +127,7 @@ struct nvme_rdma_wr {
 
 struct spdk_nvmf_cmd {
 	struct spdk_nvme_cmd cmd;
+	uint8_t inline_connect_data[sizeof(struct spdk_nvmf_fabric_connect_data)];
 	struct spdk_nvme_sgl_descriptor sgl[NVME_RDMA_MAX_SGL_DESCRIPTORS];
 };
 
@@ -1698,6 +1699,10 @@ nvme_rdma_req_init(struct nvme_rdma_qpair *rqpair, struct nvme_request *req,
 		   struct spdk_nvme_rdma_req *rdma_req)
 {
 	struct spdk_nvme_ctrlr *ctrlr = rqpair->qpair.ctrlr;
+	struct spdk_nvmf_fabric_connect_data *connect_data;
+	struct spdk_nvmf_capsule_cmd *nvmf_cmd;
+	enum spdk_nvme_data_transfer xfer;
+	bool is_fabric_connect;
 	enum nvme_payload_type payload_type;
 	bool icd_supported;
 	int rc;
@@ -1712,8 +1717,27 @@ nvme_rdma_req_init(struct nvme_rdma_qpair *rqpair, struct nvme_request *req,
 	 * targets use icdoff = 0.  For targets with non-zero icdoff, we
 	 * will currently just not use inline data for now.
 	 */
-	icd_supported = spdk_nvme_opc_get_data_transfer(req->cmd.opc) == SPDK_NVME_DATA_HOST_TO_CONTROLLER
-			&& req->payload_size <= ctrlr->ioccsz_bytes && ctrlr->icdoff == 0;
+	if (req->cmd.opc == SPDK_NVME_OPC_FABRIC) {
+		nvmf_cmd = (struct spdk_nvmf_capsule_cmd *)&req->cmd;
+		xfer = spdk_nvme_opc_get_data_transfer(nvmf_cmd->fctype);
+	} else {
+		xfer = spdk_nvme_opc_get_data_transfer(req->cmd.opc);
+	}
+
+	is_fabric_connect = req->cmd.opc == SPDK_NVME_OPC_FABRIC &&
+			    nvmf_cmd->fctype == SPDK_NVMF_FABRIC_COMMAND_CONNECT;
+
+	if (is_fabric_connect) {
+		/*
+		 * Fabric CONNECT happens before the controller reports IOCCSZ.
+		 * Force CONNECT data down the in-capsule path so subnqn/hostnqn
+		 * are sent with the command instead of as an external keyed SGL.
+		 */
+		icd_supported = ctrlr->icdoff == 0;
+	} else {
+		icd_supported = xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER &&
+				req->payload_size <= ctrlr->ioccsz_bytes && ctrlr->icdoff == 0;
+	}
 
 	if (req->payload_size == 0) {
 		rc = nvme_rdma_build_null_request(rdma_req);
@@ -1736,6 +1760,17 @@ nvme_rdma_req_init(struct nvme_rdma_qpair *rqpair, struct nvme_request *req,
 	if (rc) {
 		rdma_req->req = NULL;
 		return rc;
+	}
+
+	if (is_fabric_connect && nvme_payload_type(&req->payload) == NVME_PAYLOAD_TYPE_CONTIG) {
+		connect_data = (struct spdk_nvmf_fabric_connect_data *)
+			       (req->payload.contig_or_cb_arg + req->payload_offset);
+		memcpy(rqpair->cmds[rdma_req->id].inline_connect_data, connect_data, req->payload_size);
+		rdma_req->send_wr.num_sge = 1;
+		rdma_req->send_sgl[0].length = sizeof(struct spdk_nvme_cmd) + req->payload_size;
+		rdma_req->send_sgl[1].addr = 0;
+		rdma_req->send_sgl[1].length = 0;
+		rdma_req->send_sgl[1].lkey = 0;
 	}
 
 	memcpy(&rqpair->cmds[rdma_req->id], &req->cmd, sizeof(req->cmd));

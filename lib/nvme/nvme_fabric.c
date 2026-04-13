@@ -576,10 +576,17 @@ nvme_fabric_qpair_connect_async(struct spdk_nvme_qpair *qpair, uint32_t num_entr
 	snprintf(nvmf_data->hostnqn, sizeof(nvmf_data->hostnqn), "%s", ctrlr->opts.hostnqn);
 	snprintf(nvmf_data->subnqn, sizeof(nvmf_data->subnqn), "%s", ctrlr->trid.subnqn);
 
-	rc = spdk_nvme_ctrlr_cmd_io_raw(ctrlr, qpair,
-					(struct spdk_nvme_cmd *)&cmd,
-					nvmf_data, sizeof(*nvmf_data),
-					nvme_completion_poll_cb, status);
+	if (nvme_qpair_is_admin_queue(qpair)) {
+		rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr,
+						   (struct spdk_nvme_cmd *)&cmd,
+						   nvmf_data, sizeof(*nvmf_data),
+						   nvme_completion_poll_cb, status);
+	} else {
+		rc = spdk_nvme_ctrlr_cmd_io_raw(ctrlr, qpair,
+						(struct spdk_nvme_cmd *)&cmd,
+						nvmf_data, sizeof(*nvmf_data),
+						nvme_completion_poll_cb, status);
+	}
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to allocate/submit FABRIC_CONNECT command, rc %d\n", rc);
 		spdk_free(status->dma_data);
