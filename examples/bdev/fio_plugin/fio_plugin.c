@@ -77,6 +77,8 @@ struct spdk_fio_options {
 struct spdk_fio_request {
 	struct io_u		*io;
 	struct thread_data	*td;
+	/* Completion may run after fio clears td->io_ops_data during cleanup. */
+	struct spdk_fio_thread	*fio_thread;
 };
 
 struct spdk_fio_target {
@@ -98,6 +100,7 @@ struct spdk_fio_thread {
 	struct io_u		**iocq;		/* io completion queue */
 	unsigned int		iocq_count;	/* number of iocq entries filled by last getevents */
 	unsigned int		iocq_size;	/* number of iocq entries allocated */
+	unsigned int		outstanding;	/* number of queued I/Os not yet completed */
 
 	TAILQ_ENTRY(spdk_fio_thread)	link;
 };
@@ -183,6 +186,15 @@ spdk_fio_cleanup_thread(struct spdk_fio_thread *fio_thread)
 	pthread_mutex_lock(&g_init_mtx);
 	TAILQ_INSERT_TAIL(&g_threads, fio_thread, link);
 	pthread_mutex_unlock(&g_init_mtx);
+}
+
+static void
+spdk_fio_drain_thread(struct spdk_fio_thread *fio_thread)
+{
+	while (fio_thread->outstanding > 0) {
+		fio_thread->iocq_count = 0;
+		spdk_fio_poll_thread(fio_thread);
+	}
 }
 
 static void
@@ -664,6 +676,7 @@ spdk_fio_cleanup(struct thread_data *td)
 {
 	struct spdk_fio_thread *fio_thread = td->io_ops_data;
 
+	spdk_fio_drain_thread(fio_thread);
 	spdk_fio_cleanup_thread(fio_thread);
 	td->io_ops_data = NULL;
 }
@@ -731,12 +744,12 @@ spdk_fio_completion_cb(struct spdk_bdev_io *bdev_io,
 		       void *cb_arg)
 {
 	struct spdk_fio_request		*fio_req = cb_arg;
-	struct thread_data		*td = fio_req->td;
-	struct spdk_fio_thread		*fio_thread = td->io_ops_data;
+	struct spdk_fio_thread		*fio_thread = fio_req->fio_thread;
 
 	assert(fio_thread->iocq_count < fio_thread->iocq_size);
 	fio_req->io->error = success ? 0 : EIO;
 	fio_thread->iocq[fio_thread->iocq_count++] = fio_req->io;
+	fio_thread->outstanding--;
 
 	spdk_bdev_free_io(bdev_io);
 }
@@ -765,9 +778,12 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 	struct spdk_fio_target *target = io_u->file->engine_data;
 
 	assert(fio_req->td == td);
+	fio_req->fio_thread = td->io_ops_data;
+	fio_req->fio_thread->outstanding++;
 
 	if (!target) {
 		SPDK_ERRLOG("Unable to look up correct I/O target.\n");
+		fio_req->fio_thread->outstanding--;
 		fio_req->io->error = ENODEV;
 		return FIO_Q_COMPLETED;
 	}
@@ -811,10 +827,12 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 	}
 
 	if (rc == -ENOMEM) {
+		fio_req->fio_thread->outstanding--;
 		return FIO_Q_BUSY;
 	}
 
 	if (rc != 0) {
+		fio_req->fio_thread->outstanding--;
 		fio_req->io->error = abs(rc);
 		return FIO_Q_COMPLETED;
 	}
